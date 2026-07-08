@@ -20,6 +20,11 @@ struct ErrorStats
     T max_abs = 0;
     T max_rel = 0;
     T rms = 0;
+    // Inputs at which the worst-case errors were observed (for reporting).
+    T worst_abs_input = 0;
+    T worst_abs_input2 = 0; // second argument (pow only), unused otherwise
+    T worst_rel_input = 0;
+    T worst_rel_input2 = 0;
 };
 
 template <typename T>
@@ -27,6 +32,97 @@ T relative_error(T actual, T expected)
 {
     const T denominator = std::max<T>(std::abs(expected), T{1});
     return std::abs(actual - expected) / denominator;
+}
+
+// Effective bits of relative precision: an error of 2^-b corresponds to b good bits.
+template <typename T>
+double effective_bits(T max_rel)
+{
+    if (max_rel <= T{0})
+    {
+        return std::numeric_limits<double>::infinity();
+    }
+    return -std::log2(static_cast<double>(max_rel));
+}
+
+// Target relative precision from CLAUDE.md: 16 bits for float, 24 bits for double.
+template <typename T>
+constexpr double target_bits()
+{
+    return std::is_same_v<T, float> ? 16.0 : 24.0;
+}
+
+// One row of the end-of-run precision report, collected across all checks.
+struct SummaryRow
+{
+    std::string name;
+    double bits = 0;         // effective bits of relative precision
+    double target = 0;       // required bits (16 float / 24 double)
+    double max_rel = 0;
+    double worst_input = 0;
+    double worst_input2 = 0; // pow second argument, NaN when unused
+};
+
+std::vector<SummaryRow> g_summary;
+
+// Prints the accuracy portion of a result line and records it for the summary.
+template <typename T>
+void print_accuracy(const std::string& name, const ErrorStats<T>& stats, bool pow_like)
+{
+    const double bits = effective_bits(stats.max_rel);
+    std::cout << std::left << std::setw(14) << name
+              << " max_abs=" << std::scientific << std::setprecision(2) << stats.max_abs
+              << " max_rel=" << stats.max_rel
+              << " rms=" << stats.rms
+              << " bits=" << std::fixed << std::setprecision(1) << bits
+              << " (margin " << std::showpos << (bits - target_bits<T>()) << std::noshowpos << ")"
+              << " worst@" << std::defaultfloat << std::setprecision(6) << stats.worst_rel_input;
+    if (pow_like)
+    {
+        std::cout << "^" << stats.worst_rel_input2;
+    }
+
+    g_summary.push_back(SummaryRow{
+        name,
+        bits,
+        target_bits<T>(),
+        static_cast<double>(stats.max_rel),
+        static_cast<double>(stats.worst_rel_input),
+        pow_like ? static_cast<double>(stats.worst_rel_input2)
+                 : std::numeric_limits<double>::quiet_NaN()});
+}
+
+// Prints the collected rows sorted worst (smallest margin) first.
+void print_summary()
+{
+    auto rows = g_summary;
+    std::sort(rows.begin(), rows.end(), [](const SummaryRow& a, const SummaryRow& b) {
+        return (a.bits - a.target) < (b.bits - b.target);
+    });
+
+    std::cout << "\n=== Precision report (worst margin first) ===\n";
+    std::cout << std::left << std::setw(14) << "function"
+              << std::right << std::setw(8) << "bits"
+              << std::setw(9) << "target"
+              << std::setw(9) << "margin"
+              << std::setw(12) << "max_rel"
+              << "  worst input\n";
+    for (const SummaryRow& r : rows)
+    {
+        std::cout << std::left << std::setw(14) << r.name
+                  << std::right << std::fixed << std::setprecision(1)
+                  << std::setw(8) << r.bits
+                  << std::setw(9) << r.target
+                  << std::setw(9) << std::showpos << (r.bits - r.target) << std::noshowpos
+                  << std::scientific << std::setprecision(2) << std::setw(12) << r.max_rel
+                  << "  " << std::defaultfloat << std::setprecision(6) << r.worst_input;
+        if (!std::isnan(r.worst_input2))
+        {
+            std::cout << "^" << r.worst_input2;
+        }
+        std::cout << '\n';
+    }
+    std::cout << "(bits = -log2(max_rel); margin = bits - target; target 16=float, 24=double)\n";
 }
 
 template <typename T, typename DspFn, typename StdFn>
@@ -42,8 +138,16 @@ ErrorStats<T> compare_unary(const std::vector<T>& inputs, DspFn dsp_fn, StdFn st
         const T abs_error = std::abs(actual - expected);
         const T rel_error = relative_error(actual, expected);
 
-        stats.max_abs = std::max(stats.max_abs, abs_error);
-        stats.max_rel = std::max(stats.max_rel, rel_error);
+        if (abs_error > stats.max_abs)
+        {
+            stats.max_abs = abs_error;
+            stats.worst_abs_input = input;
+        }
+        if (rel_error > stats.max_rel)
+        {
+            stats.max_rel = rel_error;
+            stats.worst_rel_input = input;
+        }
         sum_squared += static_cast<long double>(abs_error) * static_cast<long double>(abs_error);
     }
 
@@ -100,11 +204,8 @@ bool check_unary(const std::string& name,
     const double dsp_ns = benchmark_ns_per_call(inputs, dsp_fn, benchmark_iterations);
     const double std_ns = benchmark_ns_per_call(inputs, std_fn, benchmark_iterations);
 
-    std::cout << std::left << std::setw(14) << name
-              << " max_abs=" << std::scientific << stats.max_abs
-              << " max_rel=" << stats.max_rel
-              << " rms=" << stats.rms
-              << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
+    print_accuracy(name, stats, /*pow_like=*/false);
+    std::cout << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
               << " std_ns=" << std_ns
               << " ratio=" << dsp_ns / std_ns << '\n';
 
@@ -131,8 +232,18 @@ bool check_pow(const std::vector<T>& bases,
         const T abs_error = std::abs(actual - expected);
         const T rel_error = relative_error(actual, expected);
 
-        stats.max_abs = std::max(stats.max_abs, abs_error);
-        stats.max_rel = std::max(stats.max_rel, rel_error);
+        if (abs_error > stats.max_abs)
+        {
+            stats.max_abs = abs_error;
+            stats.worst_abs_input = bases[i];
+            stats.worst_abs_input2 = exponents[i];
+        }
+        if (rel_error > stats.max_rel)
+        {
+            stats.max_rel = rel_error;
+            stats.worst_rel_input = bases[i];
+            stats.worst_rel_input2 = exponents[i];
+        }
         sum_squared += static_cast<long double>(abs_error) * static_cast<long double>(abs_error);
     }
     stats.rms = static_cast<T>(std::sqrt(sum_squared / static_cast<long double>(count)));
@@ -157,11 +268,8 @@ bool check_pow(const std::vector<T>& bases,
     const double dsp_ns = benchmark([](T base, T exponent) { return DSPmath::pow(base, exponent); });
     const double std_ns = benchmark([](T base, T exponent) { return std::pow(base, exponent); });
 
-    std::cout << std::left << std::setw(14) << (std::is_same_v<T, float> ? "pow(float)" : "pow(double)")
-              << " max_abs=" << std::scientific << stats.max_abs
-              << " max_rel=" << stats.max_rel
-              << " rms=" << stats.rms
-              << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
+    print_accuracy(std::is_same_v<T, float> ? "pow(float)" : "pow(double)", stats, /*pow_like=*/true);
+    std::cout << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
               << " std_ns=" << std_ns
               << " ratio=" << dsp_ns / std_ns << '\n';
 
@@ -185,8 +293,16 @@ bool check_pow_fixed_base(const std::vector<T>& exponents,
         const T abs_error = std::abs(actual - expected);
         const T rel_error = relative_error(actual, expected);
 
-        stats.max_abs = std::max(stats.max_abs, abs_error);
-        stats.max_rel = std::max(stats.max_rel, rel_error);
+        if (abs_error > stats.max_abs)
+        {
+            stats.max_abs = abs_error;
+            stats.worst_abs_input = exponent;
+        }
+        if (rel_error > stats.max_rel)
+        {
+            stats.max_rel = rel_error;
+            stats.worst_rel_input = exponent;
+        }
         sum_squared += static_cast<long double>(abs_error) * static_cast<long double>(abs_error);
     }
     stats.rms = static_cast<T>(std::sqrt(sum_squared / static_cast<long double>(exponents.size())));
@@ -196,11 +312,8 @@ bool check_pow_fixed_base(const std::vector<T>& exponents,
     const double dsp_ns = benchmark_ns_per_call(exponents, dsp_pow2, benchmark_iterations);
     const double std_ns = benchmark_ns_per_call(exponents, std_pow2, benchmark_iterations);
 
-    std::cout << std::left << std::setw(14) << (std::is_same_v<T, float> ? "pow2(float)" : "pow2(double)")
-              << " max_abs=" << std::scientific << stats.max_abs
-              << " max_rel=" << stats.max_rel
-              << " rms=" << stats.rms
-              << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
+    print_accuracy(std::is_same_v<T, float> ? "pow2(float)" : "pow2(double)", stats, /*pow_like=*/false);
+    std::cout << " dsp_ns=" << std::fixed << std::setprecision(2) << dsp_ns
               << " std_ns=" << std_ns
               << " ratio=" << dsp_ns / std_ns << '\n';
 
@@ -210,8 +323,8 @@ bool check_pow_fixed_base(const std::vector<T>& exponents,
 template <typename T>
 bool run_type(const std::string& suffix)
 {
-    constexpr std::size_t sample_count = 4096;
-    constexpr std::size_t benchmark_iterations = 1024;
+    constexpr std::size_t sample_count = 44100;
+    constexpr std::size_t benchmark_iterations = 128;
 
     const auto trig_inputs =
         linspace<T>(static_cast<T>(-DSPmath::TAU * 8), static_cast<T>(DSPmath::TAU * 8), sample_count);
@@ -280,5 +393,7 @@ int main()
     std::cout << "Timing is approximate and reported as nanoseconds per call.\n";
 
     const bool ok = run_type<float>("float") & run_type<double>("double");
+
+    print_summary();
     return ok ? 0 : 1;
 }
