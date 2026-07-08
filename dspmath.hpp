@@ -36,17 +36,14 @@
 #include <limits>
 #include <type_traits>
 
-#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
-#include <immintrin.h>
-#define DSPMATH_HAS_SSE2 1
-#endif
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-#include <arm_neon.h>
-#define DSPMATH_HAS_NEON 1
-#if defined(__aarch64__) || defined(_M_ARM64)
-#define DSPMATH_HAS_NEON_F32_DIV 1
-#endif
+// Force inlining of the small hot-path helpers: they are called from several
+// public functions and losing inlining costs more than the code-size win.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define DSPMATH_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define DSPMATH_INLINE inline __attribute__((always_inline))
+#else
+#define DSPMATH_INLINE inline
 #endif
 
 namespace DSPmath
@@ -86,7 +83,10 @@ namespace DSPmath
         constexpr uint32_t float_sign_fraction_mask = 0x807fffff;
         constexpr uint64_t double_fraction_mask = 0x000fffffffffffffULL;
         constexpr uint64_t double_sign_fraction_mask = 0x800fffffffffffffULL;
-        constexpr std::size_t sin_lut_size = 1024;
+        // 256 entries (1 KB) suffice: quadratic interpolation error at this
+        // step is ~1e-6, below the float phase-rounding error that dominates,
+        // so a larger table buys nothing against the 16-bit target.
+        constexpr std::size_t sin_lut_size = 256;
         constexpr std::size_t sin_lut_mask = sin_lut_size - 1;
 
         constexpr float mul_add(float a, float b, float c)
@@ -176,7 +176,7 @@ namespace DSPmath
 
         inline constexpr auto sin_lut = make_sin_lut();
 
-        inline float sin_lut_quadratic(float angle)
+        DSPMATH_INLINE float sin_lut_quadratic(float angle)
         {
             constexpr float phase_scale =
                 static_cast<float>(static_cast<double>(sin_lut_size) / TAU);
@@ -201,14 +201,14 @@ namespace DSPmath
         //
         // Reduce x to a table index over [0, 2pi) plus a tiny residual delta,
         // then sin(x) = sinTab*cos(delta) + cosTab*sin(delta). With
-        // trig_lut_size == 512, delta < 2pi/512 ~= 0.0123, so
-        //   cos(delta) ~= 1 - delta^2/2   (error < 1e-9)
+        // trig_lut_size == 256, delta < 2pi/256 ~= 0.0245, so
+        //   cos(delta) ~= 1 - delta^2/2   (error d^4/24 ~= 1.5e-8)
         //   sin(delta) ~= delta(1 - delta^2/6)
-        // already clears the 24-bit (6e-8) target with room to spare.
-        // Table: 512 * 2 * 8 B = 8 KB, well within L1; the hot path is
+        // still clears the 24-bit (6e-8) target with 4x margin.
+        // Table: 256 * 2 * 8 B = 4 KB, well within L1; the hot path is
         // branchless (one floor, one mask, one lookup, a few FMAs).
         //
-        constexpr std::size_t trig_lut_size = 512;
+        constexpr std::size_t trig_lut_size = 256;
         constexpr std::size_t trig_lut_mask = trig_lut_size - 1;
 
         // Self-contained accurate sin used at compile time and to fill the LUT.
@@ -284,7 +284,7 @@ namespace DSPmath
             double cos_d;
         };
 
-        inline sincos_d trig_lut_reduce(double angle)
+        DSPMATH_INLINE sincos_d trig_lut_reduce(double angle)
         {
             constexpr double scale = static_cast<double>(trig_lut_size) / TAU;
             constexpr double inv_scale = TAU / static_cast<double>(trig_lut_size);
@@ -306,14 +306,14 @@ namespace DSPmath
             return r;
         }
 
-        inline double sin_lut_double(double angle)
+        DSPMATH_INLINE double sin_lut_double(double angle)
         {
             const sincos_d r = trig_lut_reduce(angle);
             // sin(a + d) = sin a cos d + cos a sin d
             return mul_add(r.sin_a, r.cos_d, r.cos_a * r.sin_d);
         }
 
-        inline double cos_lut_double(double angle)
+        DSPMATH_INLINE double cos_lut_double(double angle)
         {
             const sincos_d r = trig_lut_reduce(angle);
             // cos(a + d) = cos a cos d - sin a sin d
@@ -384,7 +384,7 @@ namespace DSPmath
         inline constexpr auto pow_log2_lut = make_pow_log2_lut();
         inline constexpr auto pow_exp2_lut = make_pow_exp2_lut();
 
-        inline float pow_log2_float(float x)
+        DSPMATH_INLINE float pow_log2_float(float x)
         {
             const uint32_t bits = std::bit_cast<uint32_t>(x);
             const int e = static_cast<int>((bits >> 23) & 0xff) - 127;
@@ -397,7 +397,7 @@ namespace DSPmath
             return static_cast<float>(e) + log2m;
         }
 
-        inline float pow_exp2_float(float t)
+        DSPMATH_INLINE float pow_exp2_float(float t)
         {
             if (t >= 128.0f)
             {
@@ -440,6 +440,90 @@ namespace DSPmath
             bits = (bits & float_sign_fraction_mask) | (static_cast<uint32_t>(exponent) << 23);
             return std::bit_cast<float>(bits);
         }
+
+        //
+        // double exp2 core: 2^t = 2^n * 2^(j/64) * e^g, g in [0, ln2/64).
+        //
+        // 64-entry LUT (512 B) + cubic residual: truncation error g^4/24
+        // ~= 5.7e-10, far inside the 24-bit target. Shorter dependency chain
+        // than the degree-7 Horner it replaces, and shared by exp(double),
+        // pow(double) and pow2(double) (which then skip the ln <-> log2
+        // conversion multiplies entirely).
+        //
+        constexpr std::size_t exp2d_lut_size = 64;
+
+        constexpr std::array<double, exp2d_lut_size> make_exp2d_lut()
+        {
+            std::array<double, exp2d_lut_size> table{};
+            for (std::size_t j = 0; j < exp2d_lut_size; ++j)
+            {
+                // 2^(j/64) = exp((j/64) ln2), Taylor (compile time only).
+                const double g =
+                    static_cast<double>(j) / static_cast<double>(exp2d_lut_size) * LN2;
+                double term = 1.0;
+                double s = 1.0;
+                for (int k = 1; k < 30; ++k)
+                {
+                    term *= g / static_cast<double>(k);
+                    s += term;
+                }
+                table[j] = s;
+            }
+            return table;
+        }
+
+        inline constexpr auto exp2d_lut = make_exp2d_lut();
+
+        // Bias added to t*64 so simple int64 truncation is a floor (input is
+        // always positive) — no data-dependent branch in the hot path.
+        constexpr double exp2d_bias = 1024.0 * static_cast<double>(exp2d_lut_size);
+
+        // scaled_b = t * 64 + exp2d_bias, caller guarantees it is in
+        // (0, 2 * exp2d_bias) so truncation == floor.
+        DSPMATH_INLINE double exp2_scaled_core(double scaled_b)
+        {
+            constexpr double step = LN2 / static_cast<double>(exp2d_lut_size);
+
+            const int64_t m = static_cast<int64_t>(scaled_b);
+            const double g = (scaled_b - static_cast<double>(m)) * step;
+
+            // e^g with g < ln2/64: cubic keeps the error at ~6e-10.
+            const double p =
+                mul_add(mul_add(mul_add(1.0 / 6.0, g, 0.5), g, 1.0), g, 1.0);
+            const double mantissa =
+                exp2d_lut[static_cast<std::size_t>(m) & (exp2d_lut_size - 1)] * p;
+            const int integer_exp = static_cast<int>(m >> 6) - 1024; // log2(64) == 6
+
+            uint64_t bits = std::bit_cast<uint64_t>(mantissa);
+            const int exponent =
+                static_cast<int>((bits >> 52) & 0x7ff) + integer_exp;
+            if (exponent <= 0)
+            {
+                return 0.0;
+            }
+            if (exponent >= 2047)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+            bits = (bits & double_sign_fraction_mask) |
+                   (static_cast<uint64_t>(exponent) << 52);
+            return std::bit_cast<double>(bits);
+        }
+
+        DSPMATH_INLINE double exp2_lut_double(double t)
+        {
+            if (t >= 1024.0)
+            {
+                return std::numeric_limits<double>::infinity();
+            }
+            if (t <= -1022.0)
+            {
+                return 0.0;
+            }
+
+            return exp2_scaled_core(
+                mul_add(t, static_cast<double>(exp2d_lut_size), exp2d_bias));
+        }
     }
 
     //
@@ -474,7 +558,7 @@ namespace DSPmath
     //
     // log
     ///
-    constexpr float log2(float x)
+    DSPMATH_INLINE constexpr float log2(float x)
     {
         // Mobius transform (diameter 1/3) + odd series; faster than std here and
         // more accurate than a same-speed mantissa LUT, so kept over a LUT.
@@ -495,10 +579,12 @@ namespace DSPmath
 
         float z2 = z * z;
 
+        // Three terms of the atanh series with the last coefficient tuned
+        // (1/5 -> minimax-ish) so the truncated z^7/z^9 tail equioscillates;
+        // keeps max_rel ~2e-6, well inside the 16-bit target, one FMA shorter.
         float p =
-            1.0f / 9.0f;
+            0.1543f;
 
-        p = detail::mul_add(p, z2, 1.0f / 7.0f);
         p = detail::mul_add(p, z2, 1.0f / 5.0f);
         p = detail::mul_add(p, z2, 1.0f / 3.0f);
         p = detail::mul_add(p, z2, 1.0f);
@@ -506,7 +592,7 @@ namespace DSPmath
         return static_cast<float>(e) + (2.0f * z * p) * static_cast<float>(LOG2E);
     }
 
-    constexpr double log2(double x)
+    DSPMATH_INLINE constexpr double log2(double x)
     {
         uint64_t bits = std::bit_cast<uint64_t>(x);
 
@@ -525,10 +611,9 @@ namespace DSPmath
 
         double z2 = z * z;
 
+        // Truncated after 1/13: tail ~1.5e-8 in log2, inside the 24-bit target.
         double p =
-            1.0 / 15.0;
-
-        p = detail::mul_add(p, z2, 1.0 / 13.0);
+            1.0 / 13.0;
         p = detail::mul_add(p, z2, 1.0 / 11.0);
         p = detail::mul_add(p, z2, 1.0 / 9.0);
         p = detail::mul_add(p, z2, 1.0 / 7.0);
@@ -539,13 +624,13 @@ namespace DSPmath
         return static_cast<double>(e) + (2.0 * z * p) * LOG2E;
     }
 
-    constexpr float log(float x)
+    DSPMATH_INLINE constexpr float log(float x)
     {
         // ln(x) = log2(x) / log2(e) = log2(x) * ln2 (division folded to a multiply).
         return log2(x) * static_cast<float>(LN2);
     }
 
-    constexpr double log(double x)
+    DSPMATH_INLINE constexpr double log(double x)
     {
         // ln(x) = log2(x) / log2(e) = log2(x) * ln2 (division folded to a multiply).
         return log2(x) * LN2;
@@ -581,7 +666,7 @@ namespace DSPmath
     }
 
     // Fused float path: pow(b, e) = 2^(e * log2(b)), both halves LUT-based.
-    constexpr float pow(float base, float exponent)
+    DSPMATH_INLINE constexpr float pow(float base, float exponent)
     {
         if (std::is_constant_evaluated())
         {
@@ -591,10 +676,23 @@ namespace DSPmath
         return detail::pow_exp2_float(exponent * detail::pow_log2_float(base));
     }
 
+    // Fused double path: pow(b, e) = 2^(e * log2(b)); log2 is constant-folded
+    // when the base is known at compile time, and the ln <-> log2 conversion
+    // multiplies of the generic exp(e*log b) route disappear.
+    DSPMATH_INLINE constexpr double pow(double base, double exponent)
+    {
+        if (std::is_constant_evaluated())
+        {
+            return exp(exponent * log(base));
+        }
+
+        return detail::exp2_lut_double(exponent * log2(base));
+    }
+
     //
     // exp
     //
-    constexpr float exp(float x)
+    DSPMATH_INLINE constexpr float exp(float x)
     {
         const float ln2 =
             static_cast<float>(LN2);
@@ -619,10 +717,9 @@ namespace DSPmath
         // exp(r)
         // 1+r(1+r(1/2+r(1/6+r(...))))
 
+        // Degree 5 suffices: r^6/720 with |r| <= ln2/2 is ~2.4e-6, inside 16-bit.
         float p =
-            static_cast<float>(1.0 / 720.0);
-
-        p = detail::mul_add(p, r, static_cast<float>(1.0 / 120.0));
+            static_cast<float>(1.0 / 120.0);
         p = detail::mul_add(p, r, static_cast<float>(1.0 / 24.0));
         p = detail::mul_add(p, r, static_cast<float>(1.0 / 6.0));
         p = detail::mul_add(p, r, static_cast<float>(0.5));
@@ -648,13 +745,22 @@ namespace DSPmath
 
         return std::bit_cast<float>(bits);
     }
-    constexpr double exp(double x)
+    DSPMATH_INLINE constexpr double exp(double x)
     {
         if (x > 709.0)
             return std::numeric_limits<double>::infinity();
 
         if (x < -709.0)
             return 0.0;
+
+        if (!std::is_constant_evaluated())
+        {
+            // e^x = 2^(x * log2 e): LUT core; the |x| <= 709 clamp above already
+            // bounds the biased index, so one FMA feeds the core directly.
+            return detail::exp2_scaled_core(detail::mul_add(
+                x, INV_LN2 * static_cast<double>(detail::exp2d_lut_size),
+                detail::exp2d_bias));
+        }
 
         int n =
             static_cast<int>(
@@ -700,7 +806,7 @@ namespace DSPmath
     //
     // sin, cos
     //
-    constexpr float sin(float angle)
+    DSPMATH_INLINE constexpr float sin(float angle)
     {
         if (std::is_constant_evaluated())
         {
@@ -710,7 +816,7 @@ namespace DSPmath
         return detail::sin_lut_quadratic(angle);
     }
 
-    constexpr double sin(double angle)
+    DSPMATH_INLINE constexpr double sin(double angle)
     {
         if (std::is_constant_evaluated())
         {
@@ -726,7 +832,7 @@ namespace DSPmath
         return sin(angle + static_cast<T>(PI / 2));
     }
 
-    constexpr double cos(double angle)
+    DSPMATH_INLINE constexpr double cos(double angle)
     {
         if (std::is_constant_evaluated())
         {
