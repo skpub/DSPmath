@@ -124,6 +124,23 @@ are hardware- and compiler-dependent and have run-to-run noise.
 `float` `exp`/`log` are roughly at parity: the platform's `std` (AVX2) is
 already excellent there.
 
+On Apple Silicon (Apple A18 Pro, arm64, Apple clang 21, `-O3`), median of
+3 runs of `tests/compare_std.cpp`:
+
+| function | ratio (float) | ratio (double) |
+|---|---|---|
+| `sin` / `cos` | ~0.71 | **~0.53** |
+| `log` | ~0.70 | ~0.73 |
+| `log2` | **~0.56** | ~0.73 |
+| `exp` | ~0.85 | ~0.63 |
+| `pow` | **~0.57** | **~0.56** |
+| `pow` (base 2) | ~0.87 | ~0.78 |
+
+Every function beats `std` on this platform, including `float` `exp` — there
+the runtime path delegates to the shared `2^t` LUT core
+(`exp(x) = 2^(x·log₂e)`), which wins against arm64 `std::exp` even though it
+only reaches parity against the AVX2 `std::exp` on MSVC.
+
 > **Note on inlining.** In a large translation unit, MSVC's inline budget can
 > run out for functions this small, silently disabling both the runtime LUT
 > path *and* compile-time constant folding for known bases/exponents. Every
@@ -248,6 +265,23 @@ clang++ -std=c++20 -O3 -mavx2 -mfma -ffast-math -I. tests/compare_std.cpp -o com
 
 `float` の `exp`/`log` はほぼ互角です。この環境の `std`（AVX2）が既に非常に
 速いためです。
+
+Apple Silicon（Apple A18 Pro、arm64、Apple clang 21、`-O3`）での
+`tests/compare_std.cpp` 3 回実行の中央値:
+
+| 関数 | ratio (float) | ratio (double) |
+|---|---|---|
+| `sin` / `cos` | ~0.71 | **~0.53** |
+| `log` | ~0.70 | ~0.73 |
+| `log2` | **~0.56** | ~0.73 |
+| `exp` | ~0.85 | ~0.63 |
+| `pow` | **~0.57** | **~0.56** |
+| `pow`（底2） | ~0.87 | ~0.78 |
+
+このプラットフォームでは `float` の `exp` を含む全関数が `std` を上回ります。
+`exp` のランタイム経路は共有の `2^t` LUT コアへの委譲
+（`exp(x) = 2^(x·log₂e)`）で、MSVC の AVX2 版 `std::exp` 相手には互角止まり
+だったのに対し、arm64 の `std::exp` には明確に勝ちます。
 
 > **インライン化についての注意。** 大きな翻訳単位では、MSVC のインライン予算
 > がこの小ささの関数でも尽きることがあり、ランタイムの LUT パスと、既知の底・

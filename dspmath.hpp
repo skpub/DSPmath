@@ -181,12 +181,18 @@ namespace DSPmath
             constexpr float phase_scale =
                 static_cast<float>(static_cast<double>(sin_lut_size) / TAU);
 
-            const float phase = angle * phase_scale;
-            int index = static_cast<int>(phase);
-            index -= phase < static_cast<float>(index) ? 1 : 0;
-            const float t = phase - static_cast<float>(index);
+            // Bias trick (see pow_exp2_float): the index is taken mod the LUT
+            // size anyway, so a large positive multiple-of-size bias turns the
+            // truncation into a branchless floor. 2^22 is a multiple of the LUT
+            // size, keeps phase+bias exact (< 2^23) and positive for |angle| up
+            // to ~1e5 -- beyond where float phase retains any precision anyway.
+            constexpr float floor_bias = 4194304.0f; // 2^22
 
-            const std::size_t center = static_cast<std::size_t>(index) & sin_lut_mask;
+            const float phase = angle * phase_scale;
+            const int biased = static_cast<int>(phase + floor_bias);
+            const float t = phase - (static_cast<float>(biased) - floor_bias);
+
+            const std::size_t center = static_cast<std::size_t>(biased) & sin_lut_mask;
             const float previous = sin_lut[(center - 1) & sin_lut_mask];
             const float current = sin_lut[center];
             const float next = sin_lut[(center + 1) & sin_lut_mask];
@@ -413,13 +419,20 @@ namespace DSPmath
             constexpr float k1 = static_cast<float>(step);
             constexpr float k2 = static_cast<float>(0.5 * step * step);
 
-            const float scaled = t * scale;
-            int m = static_cast<int>(scaled);
-            m -= (scaled < static_cast<float>(m)) ? 1 : 0; // floor
-            const float u = scaled - static_cast<float>(m);
+            // Bias trick: t in (-126,128) => scaled in (-32256, 32768). Adding a
+            // positive multiple-of-256 bias makes the value positive, so plain
+            // int truncation equals floor with no data-dependent branch. The
+            // bias cancels in the &255 mask and only shifts integer_exp by
+            // bias/256, so it is subtracted back below.
+            constexpr float floor_bias = 65536.0f; // 256 * 256
+            constexpr int floor_bias_exp = 256;    // floor_bias / 256
 
-            const std::size_t j = static_cast<std::size_t>(m) & (pow_exp2_lut_size - 1);
-            const int integer_exp = m >> 8; // log2(N) == 8
+            const float scaled = t * scale;
+            const int mb = static_cast<int>(scaled + floor_bias); // floor(scaled)+bias
+            const float u = scaled - (static_cast<float>(mb) - floor_bias);
+
+            const std::size_t j = static_cast<std::size_t>(mb) & (pow_exp2_lut_size - 1);
+            const int integer_exp = (mb >> 8) - floor_bias_exp; // log2(N) == 8
 
             // 2^(u/N): quadratic residual keeps the relative error near float
             // epsilon, which matters because pow amplifies it by ~ln2*exponent.
@@ -694,6 +707,14 @@ namespace DSPmath
     //
     DSPMATH_INLINE constexpr float exp(float x)
     {
+        if (!std::is_constant_evaluated())
+        {
+            // e^x = 2^(x * log2 e): reuse the exp2 LUT core (pow2 float path),
+            // which is both faster (short dependency chain) and more accurate
+            // than the degree-5 Horner reduction below.
+            return detail::pow_exp2_float(x * static_cast<float>(INV_LN2));
+        }
+
         const float ln2 =
             static_cast<float>(LN2);
 
