@@ -114,15 +114,17 @@ are hardware- and compiler-dependent and have run-to-run noise.
 
 | function | ratio (float) | ratio (double) |
 |---|---|---|
-| `sin` / `cos` | ~0.71 | **~0.60** |
-| `log` | ~0.98 | ~0.74 |
-| `log2` | ~0.95 | **~0.46** |
-| `exp` | ~1.0 (parity) | ~0.83 |
-| `pow` | **~0.86** | ~0.62 |
-| `pow` (base 2) | ~0.51 | **~0.26** |
+| `sin` / `cos` | ~0.74 | **~0.62** |
+| `log` | ~0.98 | ~0.73 |
+| `log2` | ~0.99 | **~0.45** |
+| `exp` | ~0.99 (parity) | ~0.84 |
+| `pow` | **~0.74** | ~0.63 |
+| `pow` (base 2) | ~0.45 | **~0.25** |
 
-`float` `exp`/`log` are roughly at parity: the platform's `std` (AVX2) is
-already excellent there.
+`float` `exp`/`log2` are roughly at parity: the platform's `std` (AVX2) is
+already excellent there. `pow`/`pow2` (`float`) improved (was ~0.86 / ~0.51)
+after `exp(float)` was rerouted onto the shared `2^t` core, which the whole
+`pow` family now reuses.
 
 On Apple Silicon (Apple A18 Pro, arm64, Apple clang 21, `-O3`), median of
 3 runs of `tests/compare_std.cpp`:
@@ -256,15 +258,17 @@ clang++ -std=c++20 -O3 -mavx2 -mfma -ffast-math -I. tests/compare_std.cpp -o com
 
 | 関数 | ratio (float) | ratio (double) |
 |---|---|---|
-| `sin` / `cos` | ~0.71 | **~0.60** |
-| `log` | ~0.98 | ~0.74 |
-| `log2` | ~0.95 | **~0.46** |
-| `exp` | ~1.0（互角） | ~0.83 |
-| `pow` | **~0.86** | ~0.62 |
-| `pow`（底2） | ~0.51 | **~0.26** |
+| `sin` / `cos` | ~0.74 | **~0.62** |
+| `log` | ~0.98 | ~0.73 |
+| `log2` | ~0.99 | **~0.45** |
+| `exp` | ~0.99（互角） | ~0.84 |
+| `pow` | **~0.74** | ~0.63 |
+| `pow`（底2） | ~0.45 | **~0.25** |
 
-`float` の `exp`/`log` はほぼ互角です。この環境の `std`（AVX2）が既に非常に
-速いためです。
+`float` の `exp`/`log2` はほぼ互角です。この環境の `std`（AVX2）が既に非常に
+速いためです。`pow`/`pow2`（`float`）は `exp(float)` が共有の `2^t` コアに
+委譲されたことで、`pow` 系全体がそのコアを再利用するようになり改善しました
+（以前は ~0.86 / ~0.51）。
 
 Apple Silicon（Apple A18 Pro、arm64、Apple clang 21、`-O3`）での
 `tests/compare_std.cpp` 3 回実行の中央値:
