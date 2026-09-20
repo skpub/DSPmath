@@ -26,6 +26,9 @@ used in audio DSP. The design goal is: **faster than `std` at runtime** with
   when an argument (e.g. a `pow` base) is a constant, the work folds away.
 - **MIT licensed.**
 
+DSPmath is used in [IMFMSynth](https://imfm-synth.com), an 8-operator synth
+with FM and wavetable synthesis.
+
 ### Functions
 
 | Function | Notes |
@@ -171,6 +174,9 @@ DSPmath は、オーディオ DSP でよく使う超越関数の差し替え用�
 - **すべて `constexpr`。** 全関数がコンパイル時評価可能で、引数（例えば `pow`
   の底）が定数なら計算は畳み込まれて消えます。
 - **MIT ライセンス。**
+
+DSPmath は、8オペレータで FM と Wavetable が使えるシンセ
+[IMFMSynth](https://imfm-synth.com) で使用されています。
 
 ### 関数一覧
 
