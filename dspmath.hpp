@@ -176,6 +176,30 @@ namespace DSPmath
 
         inline constexpr auto sin_lut = make_sin_lut();
 
+        struct sin_coefficients
+        {
+            float value;
+            float slope;
+            float curvature;
+        };
+
+        constexpr auto make_sin_coefficients()
+        {
+            std::array<sin_coefficients, sin_lut_size> table{};
+            for (std::size_t i = 0; i < sin_lut_size; ++i)
+            {
+                const float previous = sin_lut[(i - 1) & sin_lut_mask];
+                const float current = sin_lut[i];
+                const float next = sin_lut[(i + 1) & sin_lut_mask];
+                table[i] = {current, 0.5f * (next - previous),
+                            0.5f * (next - 2.0f * current + previous)};
+            }
+            return table;
+        }
+
+        // 3 KiB: precompute the three-point interpolation differences.
+        inline constexpr auto sin_coeff_lut = make_sin_coefficients();
+
         DSPMATH_INLINE float sin_lut_quadratic(float angle)
         {
             constexpr float phase_scale =
@@ -193,13 +217,9 @@ namespace DSPmath
             const float t = phase - (static_cast<float>(biased) - floor_bias);
 
             const std::size_t center = static_cast<std::size_t>(biased) & sin_lut_mask;
-            const float previous = sin_lut[(center - 1) & sin_lut_mask];
-            const float current = sin_lut[center];
-            const float next = sin_lut[(center + 1) & sin_lut_mask];
-
-            const float slope = 0.5f * (next - previous);
-            const float curvature = 0.5f * (next - 2.0f * current + previous);
-            return mul_add(curvature, t * t, mul_add(slope, t, current));
+            const auto coefficients = sin_coeff_lut[center];
+            return mul_add(coefficients.curvature, t * t,
+                           mul_add(coefficients.slope, t, coefficients.value));
         }
 
         //
@@ -353,6 +373,42 @@ namespace DSPmath
                 sum += term / static_cast<double>(k);
             }
             return 2.0 * sum / LN2;
+        }
+
+        struct log2_coefficient
+        {
+            double reciprocal;
+            double logarithm;
+        };
+
+        constexpr auto make_log2_double_lut()
+        {
+            std::array<log2_coefficient, 64> table{};
+            for (std::size_t i = 0; i < table.size(); ++i)
+            {
+                const double center = 1.0 + (static_cast<double>(i) + 0.5) / 64.0;
+                table[i] = {1.0 / center, log2_for_table(center)};
+            }
+            return table;
+        }
+
+        inline constexpr auto log2_double_lut = make_log2_double_lut();
+
+        // Positive normal inputs: x = 2^e*m, r = m/center - 1.
+        // |r| <= 1/129; degree-four log1p residual, no runtime division.
+        DSPMATH_INLINE double log2_lut_double(double x)
+        {
+            const uint64_t bits = std::bit_cast<uint64_t>(x);
+            const int exponent = static_cast<int>((bits >> 52) & 0x7ff) - 1023;
+            const uint64_t fraction = bits & double_fraction_mask;
+            const double mantissa = std::bit_cast<double>(fraction | (uint64_t{1023} << 52));
+            const auto coefficients = log2_double_lut[fraction >> 46];
+            const double r = mul_add(mantissa, coefficients.reciprocal, -1.0);
+            double p = mul_add(-0.25, r, 1.0 / 3.0);
+            p = mul_add(p, r, -0.5);
+            p = mul_add(p, r, 1.0);
+            return static_cast<double>(exponent) +
+                   (coefficients.logarithm + (r * p) * LOG2E);
         }
 
         constexpr std::array<float, pow_log2_lut_size + 1> make_pow_log2_lut()
@@ -607,6 +663,11 @@ namespace DSPmath
 
     DSPMATH_INLINE constexpr double log2(double x)
     {
+        if (!std::is_constant_evaluated())
+        {
+            return detail::log2_lut_double(x);
+        }
+
         uint64_t bits = std::bit_cast<uint64_t>(x);
 
         int e =
